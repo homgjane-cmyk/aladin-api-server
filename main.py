@@ -306,43 +306,148 @@ def check_url(url: str) -> bool:
         return False
 
 def normalize_aladin_image_url(src: Optional[str]) -> Optional[str]:
-    if not src: return None
-    src = src.strip().strip('"').strip("'")
-    if src.startswith("//"): src = "https:" + src
-    elif src.startswith("http://"): src = src.replace("http://", "https://", 1)
-    if not src.startswith("https://image.aladin.co.kr/"): return None
-    return src.replace("coversum", "cover500").replace("cover200", "cover500").replace("/cover/", "/cover500/")
+    if not src:
+        return None
 
-def extract_image_from_node(node) -> Optional[str]:
-    for attr in ["src", "data-src", "data-original", "data-lazy", "data-url"]:
-        if node.get(attr): return normalize_aladin_image_url(node.get(attr))
-    match = re.search(r"url\(['\"]?([^'\")]+)['\"]?\)", node.get("style", ""), re.IGNORECASE)
-    if match: return normalize_aladin_image_url(match.group(1))
-    return None
+    src = str(src).strip().strip('"').strip("'").replace("&amp;", "&")
+
+    if src.startswith("//"):
+        src = "https:" + src
+    elif src.startswith("/"):
+        src = ALADIN_WEB_BASE + src
+    elif src.startswith("http://"):
+        src = src.replace("http://", "https://", 1)
+
+    # 알라딘 image 서버 URL만 사용
+    if "image.aladin.co.kr/" not in src:
+        return None
+
+    # 썸네일보다 큰 표지를 우선 사용
+    src = src.replace("/coversum/", "/cover500/")
+    src = src.replace("/cover150/", "/cover500/")
+    src = src.replace("/cover200/", "/cover500/")
+    src = src.replace("/cover/", "/cover500/")
+
+    return src
 
 def extract_class_image(soup: BeautifulSoup, class_name: str) -> Optional[str]:
-    div_node = soup.select_one(f".{class_name}")
-    if not div_node:
-        return None
-    
-    img = div_node.select_one("img")
-    if img:
-        # data-src, data-original 등 lazy-loading 속성도 봄
-        url = extract_image_from_node(img)
-        if url:
-            return url
-    
-    # div 자체의 background-image 도 체크
-    match = re.search(r"url\(['\"]?([^'\")]+)['\"]?\)", div_node.get("style", ""), re.IGNORECASE)
-    if match:
-        return normalize_aladin_image_url(match.group(1))
-    
-    # div 자체에 data-src 등이 붙어있는 경우도 확인
-    for attr in ["data-src", "data-original", "data-url"]:
-        if div_node.get(attr):
-            return normalize_aladin_image_url(div_node.get(attr))
-    
+    """
+    알라딘 상품 상세페이지의 c_front / c_left / c_back 영역에서
+    표지, 책등, 뒷표지 URL을 찾습니다.
+    """
+    nodes = soup.select(f".{class_name}")
+
+    # class가 여러 개 붙은 예외까지 대응
+    if not nodes:
+        nodes = soup.select(f'[class*="{class_name}"]')
+
+    for node in nodes:
+        # 1) 내부 img 태그의 src / lazy loading 주소 확인
+        for img in node.select("img"):
+            image_url = extract_image_from_node(img)
+            if image_url:
+                return image_url
+
+        # 2) div 자체의 data-src 등 확인
+        image_url = extract_image_from_node(node)
+        if image_url:
+            return image_url
+
+        # 3) style="background-image: url(...)" 형태 확인
+        style = node.get("style", "")
+        match = re.search(
+            r"url\(\s*['\"]?([^'\"\)]+)['\"]?\s*\)",
+            style,
+            re.IGNORECASE
+        )
+        if match:
+            image_url = normalize_aladin_image_url(match.group(1))
+            if image_url:
+                return image_url
+
     return None
+
+def extract_images_from_raw_html(html: str) -> dict:
+    """
+    BeautifulSoup가 lazy-load 또는 스크립트 안의 주소를 못 찾았을 때
+    원본 HTML에서 c_front / c_left / c_back 이미지를 직접 찾습니다.
+    """
+    found = {
+        "front": None,
+        "spine": None,
+        "back": None,
+    }
+
+    class_patterns = {
+        "front": "c_front",
+        "spine": "c_left",
+        "back": "c_back",
+    }
+
+    for image_type, class_name in class_patterns.items():
+        # 해당 class 영역 근처 2,000글자 안에서 알라딘 이미지 주소 탐색
+        pattern = (
+            rf'class=["\'][^"\']*{class_name}[^"\']*["\'][^>]*>'
+            rf'[\s\S]{{0,2000}}?'
+            rf'((?:https?:)?//image\.aladin\.co\.kr/[^"\'>\s]+?\.(?:jpg|jpeg|png))'
+        )
+
+        match = re.search(pattern, html, re.IGNORECASE)
+        if match:
+            found[image_type] = normalize_aladin_image_url(match.group(1))
+
+    return found
+
+def find_images_in_all_aladin_urls(html: str) -> dict:
+    """
+    페이지 전체의 image.aladin.co.kr URL을 훑어
+    spineflip / letslook URL을 찾는 최후 폴백입니다.
+    """
+    found = {
+        "front": None,
+        "spine": None,
+        "back": None,
+    }
+
+    urls = re.findall(
+        r'(?:https?:)?//image\.aladin\.co\.kr/[^"\'<>\s\\]+?\.(?:jpg|jpeg|png)',
+        html,
+        re.IGNORECASE,
+    )
+
+    for raw_url in urls:
+        url = normalize_aladin_image_url(raw_url)
+        if not url:
+            continue
+
+        lower_url = url.lower()
+
+        # 책등 이미지
+        if not found["spine"] and (
+            "/spineflip/" in lower_url
+            or "/spine/" in lower_url
+            or re.search(r"_(?:d|s|sl)\.(?:jpg|jpeg|png)$", lower_url)
+        ):
+            found["spine"] = url
+            continue
+
+        # 뒷표지 이미지
+        if not found["back"] and (
+            "/letslook/" in lower_url
+            or re.search(r"_(?:b|bl|wbl)\.(?:jpg|jpeg|png)$", lower_url)
+        ):
+            found["back"] = url
+            continue
+
+        # 앞표지 이미지
+        if not found["front"] and (
+            "/cover500/" in lower_url
+            or "/cover200/" in lower_url
+            or "/cover/" in lower_url
+        ):
+            found["front"] = url
+
+    return found
 
 
 def extract_preview_page_images(item_id: str, headers: dict) -> dict:
@@ -362,7 +467,6 @@ def extract_preview_page_images(item_id: str, headers: dict) -> dict:
     except Exception:
         pass
     return found
-
 @app.get("/api/get-book-images")
 def get_book_images(
     item_id: str = Query(..., min_length=1),
@@ -370,45 +474,100 @@ def get_book_images(
     author: str = Query(""),
     publisher: str = Query("")
 ):
-    resolved_item_id = resolve_aladin_item_id(item_id, title, author, publisher)
+    # 카카오 ISBN / UUID라도 제목·저자·출판사로 알라딘 실제 상품 번호를 찾음
+    resolved_item_id = resolve_aladin_item_id(
+        item_id,
+        title,
+        author,
+        publisher
+    )
+
     url = f"{ALADIN_WEB_BASE}/shop/wproduct.aspx?ItemId={resolved_item_id}"
-    images = {"front": None, "spine": None, "back": None, "resolvedItemId": resolved_item_id}
-    
+
+    images = {
+        "front": None,
+        "spine": None,
+        "back": None,
+        "resolvedItemId": resolved_item_id,
+        "sourceUrl": url,
+    }
+
     try:
-        response = safe_requests_get(url, headers=DEFAULT_HEADERS, timeout=(5, 15))
+        response = safe_requests_get(
+            url,
+            headers=DEFAULT_HEADERS,
+            timeout=(5, 20)
+        )
         response.raise_for_status()
     except requests.RequestException as error:
-        raise HTTPException(status_code=502, detail={"message": "페이지 호출 실패", "reason": str(error)})
-        
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "알라딘 도서 상세 페이지를 불러오지 못했습니다.",
+                "reason": str(error),
+            }
+        )
+
     html = response.text
     soup = BeautifulSoup(html, "html.parser")
-    
+
+    # 1. 알라딘 상세페이지의 실제 클래스 기준
     images["front"] = extract_class_image(soup, "c_front")
     images["spine"] = extract_class_image(soup, "c_left")
     images["back"] = extract_class_image(soup, "c_back")
-    
-    if not all([images["front"], images["spine"], images["back"]]):
-        preview = extract_preview_page_images(resolved_item_id, DEFAULT_HEADERS)
-        for key in ["front", "spine", "back"]:
-            if not images[key] and preview.get(key): images[key] = preview[key]
-            
-    all_urls = re.findall(r'(?:https?:)?//image\.aladin\.co\.kr/product/[^"\'\s>)]+(?:\.jpg|\.png)', html, re.IGNORECASE)
-    cover_url = next((normalize_aladin_image_url(s) for s in all_urls if "cover" in s.lower() and re.search(r"_\d\.", s)), None)
-    
-    if cover_url:
-        if not images["front"]: images["front"] = cover_url
-        match = re.search(r"(https?://image\.aladin\.co\.kr/product/\d+/\d+/)(?:[^/]+)/([^/]+?)_\d.*?\.(?:jpg|png)", cover_url, re.IGNORECASE)
-        if match:
-            spine_guess = f"{match.group(1)}spineflip/{match.group(2)}_d.jpg"
-            back_guess = f"{match.group(1)}letslook/{match.group(2)}_b.jpg"
-            if not images["spine"] and check_url(spine_guess): images["spine"] = spine_guess
-            if not images["back"] and check_url(back_guess): images["back"] = back_guess
-            
-    for src in all_urls:
-        n_src = normalize_aladin_image_url(src)
-        if not n_src: continue
-        if not images["back"] and re.search(r"(/letslook/|_(b|bl|wbl)\.jpg)$", n_src, re.IGNORECASE): images["back"] = n_src
-        elif not images["spine"] and re.search(r"(/spine/|/spineflip/|_(d|s|sl)\.jpg)$", n_src, re.IGNORECASE): images["spine"] = n_src
-        elif not images["front"] and re.search(r"(/cover500/|_(f|wfl|2)\.jpg)$", n_src, re.IGNORECASE): images["front"] = n_src
-        
+
+    # 2. c_left 안의 이미지가 JS/lazy loading 방식일 경우 원본 HTML에서 재시도
+    raw_images = extract_images_from_raw_html(html)
+
+    if not images["front"] and raw_images["front"]:
+        images["front"] = raw_images["front"]
+
+    if not images["spine"] and raw_images["spine"]:
+        images["spine"] = raw_images["spine"]
+
+    if not images["back"] and raw_images["back"]:
+        images["back"] = raw_images["back"]
+
+    # 3. 전체 HTML 안의 spineflip / letslook 이미지 주소 탐색
+    all_images = find_images_in_all_aladin_urls(html)
+
+    if not images["front"] and all_images["front"]:
+        images["front"] = all_images["front"]
+
+    if not images["spine"] and all_images["spine"]:
+        images["spine"] = all_images["spine"]
+
+    if not images["back"] and all_images["back"]:
+        images["back"] = all_images["back"]
+
+    # 4. 알라딘 미리보기 뷰어에서 한 번 더 시도
+    if not images["front"] or not images["spine"] or not images["back"]:
+        preview_images = extract_preview_page_images(
+            resolved_item_id,
+            DEFAULT_HEADERS
+        )
+
+        if not images["front"] and preview_images.get("front"):
+            images["front"] = preview_images["front"]
+
+        if not images["spine"] and preview_images.get("spine"):
+            images["spine"] = preview_images["spine"]
+
+        if not images["back"] and preview_images.get("back"):
+            images["back"] = preview_images["back"]
+
+    # Render 로그에서 확인하기 위한 출력
+    print(
+        "[BOOK IMAGES]",
+        {
+            "itemId": resolved_item_id,
+            "hasFront": bool(images["front"]),
+            "hasSpine": bool(images["spine"]),
+            "hasBack": bool(images["back"]),
+            "hasCLeft": "c_left" in html,
+            "htmlLength": len(html),
+        }
+    )
+
     return images
+
