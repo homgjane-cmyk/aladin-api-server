@@ -30,34 +30,124 @@ DEFAULT_HEADERS = {
     "Referer": "https://www.aladin.co.kr/",
 }
 
-# 💡 다중 프록시 터널 (서버 하나가 죽어도 다른 서버로 자동 우회)
-def safe_requests_get(url: str, params: dict = None, headers: dict = None, timeout=(5, 20), stream=False):
+def safe_requests_get(
+    url: str,
+    params: dict = None,
+    headers: dict = None,
+    timeout=(5, 20),
+    stream=False
+):
+    """
+    서버(Render)에서는 CORS 프록시가 필요 없습니다.
+    알라딘에 우선 직접 접속하고, 실패할 때에만 기존 프록시를 사용합니다.
+    """
+    request_headers = {
+        **DEFAULT_HEADERS,
+        **(headers or {}),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "keep-alive",
+    }
+
+    try:
+        direct_response = requests.get(
+            url,
+            params=params,
+            headers=request_headers,
+            timeout=timeout,
+            stream=stream
+        )
+
+        # 알라딘의 실제 상품 페이지인지 검사
+        direct_html = "" if stream else direct_response.text
+        is_aladin_product_page = (
+            direct_response.status_code == 200
+            and (
+                "wproduct" in direct_response.url
+                or "Ere_prod" in direct_html
+                or "c_front" in direct_html
+                or "알라딘" in direct_html
+            )
+        )
+
+        if is_aladin_product_page:
+            print("[ALADIN] direct request success:", direct_response.url)
+            return direct_response
+
+        print(
+            "[ALADIN] direct request rejected or unexpected:",
+            direct_response.status_code,
+            direct_response.url,
+            "html length:",
+            len(direct_html)
+        )
+
+    except requests.RequestException as error:
+        print("[ALADIN] direct request failed:", error)
+
+    # 직접 접속이 실패한 경우에만 프록시를 시도
     if params:
         req_url = url + "?" + urllib.parse.urlencode(params)
     else:
         req_url = url
-        
+
     proxies = [
-        "https://api.allorigins.win/raw?url=" + urllib.parse.quote(req_url),
-        "https://api.codetabs.com/v1/proxy?quest=" + urllib.parse.quote(req_url),
-        "https://corsproxy.io/?" + urllib.parse.quote(req_url)
+        "https://api.allorigins.win/raw?url=" + urllib.parse.quote(req_url, safe=""),
+        "https://api.codetabs.com/v1/proxy?quest=" + urllib.parse.quote(req_url, safe=""),
+        "https://corsproxy.io/?" + urllib.parse.quote(req_url, safe=""),
     ]
-    
+
     last_error = None
+
     for proxy_url in proxies:
         try:
-            response = requests.get(proxy_url, headers=headers, timeout=timeout, stream=stream)
-            if response.status_code == 200:
+            response = requests.get(
+                proxy_url,
+                headers=request_headers,
+                timeout=timeout,
+                stream=stream
+            )
+
+            proxy_html = "" if stream else response.text
+
+            # 200이어도 프록시 오류 문서일 수 있으므로 실제 알라딘 HTML인지 검사
+            is_valid_html = (
+                response.status_code == 200
+                and len(proxy_html) > 3000
+                and (
+                    "wproduct" in proxy_html
+                    or "Ere_prod" in proxy_html
+                    or "c_front" in proxy_html
+                    or "알라딘" in proxy_html
+                )
+            )
+
+            if is_valid_html:
+                print("[ALADIN] proxy success:", proxy_url[:60])
                 return response
+
+            print(
+                "[ALADIN] proxy unexpected response:",
+                response.status_code,
+                "html length:",
+                len(proxy_html)
+            )
+
         except requests.RequestException as error:
-            print(f"프록시 접속 실패 ({proxy_url}): {error}")
+            print("[ALADIN] proxy request failed:", error)
             last_error = error
-            continue
-            
+
+    # 마지막 시도: 오류를 정확하게 확인하기 위해 직접 응답 반환
     if last_error:
-        print("모든 프록시 서버 접속 실패, 다이렉트 연결 시도")
-    
-    return requests.get(req_url, headers=headers, timeout=timeout, stream=stream)
+        print("[ALADIN] all proxy requests failed:", last_error)
+
+    return requests.get(
+        url,
+        params=params,
+        headers=request_headers,
+        timeout=timeout,
+        stream=stream
+    )
 
 @app.get("/")
 def read_root():
