@@ -262,12 +262,24 @@ def normalize_cover_url(url: Optional[str]) -> Optional[str]:
 def search_books(
     query: str = Query(..., min_length=1, max_length=200),
     max_results: int = Query(10, ge=1, le=50),
+    query_type: str = Query("Keyword"),
 ):
+    """
+    query_type:
+    - Keyword: 제목, 저자, 출판사 전체 검색
+    - Author: 저자명 중심 검색
+    - Title: 제목 중심 검색
+    """
+    allowed_query_types = {"Keyword", "Author", "Title"}
+
+    if query_type not in allowed_query_types:
+        query_type = "Keyword"
+
     data = aladin_api_get(
         "ItemSearch.aspx",
         {
             "Query": query.strip(),
-            "QueryType": "Keyword",
+            "QueryType": query_type,
             "MaxResults": max_results,
             "start": 1,
             "SearchTarget": "Book",
@@ -279,6 +291,7 @@ def search_books(
             book["cover"] = normalize_cover_url(book["cover"])
 
     return data
+
 
 @app.get("/api/ttb/search")
 def ttb_search_proxy(
