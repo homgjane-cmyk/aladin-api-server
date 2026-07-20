@@ -659,5 +659,18 @@ def get_book_images(
         }
     )
 
+        images["debug"] = {
+        "htmlLength": len(html),
+        "hasAladinProductHtml": "Ere_prod" in html,
+        "hasCFront": "c_front" in html,
+        "hasCLeft": "c_left" in html,
+        "hasCBack": "c_back" in html,
+        "imageDomainCount": html.count("image.aladin.co.kr"),
+        "responseUrl": response.url,
+        "responseStatus": response.status_code,
+    }
+
+
     return images
+
 
