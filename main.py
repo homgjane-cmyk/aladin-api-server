@@ -1,7 +1,25 @@
+"""
+Shelfy Book API hybrid server
+
+Provider policy (Asia/Seoul):
+- through 2026-10-30: Aladin TTB is primary for search/detail
+- from 2026-10-31: YES24 is primary, Kakao Book Search supplements discovery
+- Aladin web scraping remains for front/spine/back images
+- after the switch, search-list covers come from YES24
+
+Environment variables:
+- ALADIN_TTB_KEY
+- ALADIN_API_END_DATE=2026-10-30
+- YES24_API_KEY
+- KAKAO_REST_API_KEY
+"""
+
 import os
 import re
 import urllib.parse
+from datetime import date, datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
@@ -28,17 +46,22 @@ app.add_middleware(
 # Environment variables / upstream endpoints
 # ============================================================
 
-# 메인 도서 API
+# 2026-10-30까지 메인으로 사용할 알라딘 TTB API
+TTB_KEY = os.getenv("ALADIN_TTB_KEY", "").strip()
+ALADIN_API_BASE = "https://www.aladin.co.kr/ttb/api"
+ALADIN_WEB_BASE = "https://www.aladin.co.kr"
+
+# 기본값은 2026-10-30. 필요하면 Render 환경변수로 날짜를 바꿀 수 있습니다.
+ALADIN_API_END_DATE = os.getenv("ALADIN_API_END_DATE", "2026-10-30").strip()
+KST = ZoneInfo("Asia/Seoul")
+
+# 2026-10-31부터 메인 도서 API
 YES24_API_KEY = os.getenv("YES24_API_KEY", "").strip()
 YES24_API_BASE = "https://apis.yes24.com/v1"
 
-# 보조 검색 API
+# YES24 검색 결과가 부족할 때만 보조 검색
 KAKAO_REST_API_KEY = os.getenv("KAKAO_REST_API_KEY", "").strip()
 KAKAO_BOOK_API_URL = "https://dapi.kakao.com/v3/search/book"
-
-# 알라딘은 공식 TTB API를 더 이상 사용하지 않고,
-# 앞표지/책등/뒷표지를 찾기 위한 웹 페이지 조회에만 사용합니다.
-ALADIN_WEB_BASE = "https://www.aladin.co.kr"
 
 DEFAULT_HEADERS = {
     "User-Agent": (
@@ -52,17 +75,46 @@ DEFAULT_HEADERS = {
 
 
 # ============================================================
-# Health check
+# Health check / provider switch
 # ============================================================
+
+def get_aladin_end_date() -> date:
+    try:
+        return date.fromisoformat(ALADIN_API_END_DATE)
+    except ValueError:
+        return date(2026, 10, 30)
+
+
+def can_use_aladin_api() -> bool:
+    """
+    한국시간 기준 ALADIN_API_END_DATE까지 알라딘 TTB API를 우선 사용합니다.
+    키가 없으면 날짜가 남아 있어도 자동으로 YES24/Kakao 쪽으로 넘어갑니다.
+    """
+    today_kst = datetime.now(KST).date()
+    return bool(TTB_KEY) and today_kst <= get_aladin_end_date()
+
+
+def current_search_provider() -> str:
+    if can_use_aladin_api():
+        return "aladin-ttb"
+    if YES24_API_KEY:
+        return "yes24+kakao" if KAKAO_REST_API_KEY else "yes24"
+    if KAKAO_REST_API_KEY:
+        return "kakao-fallback"
+    return "unconfigured"
+
 
 @app.get("/")
 def read_root():
     return {
         "message": "Shelfy 도서 API 서버가 정상 작동 중입니다!",
+        "aladinTtbConfigured": bool(TTB_KEY),
+        "aladinApiEndDate": get_aladin_end_date().isoformat(),
+        "aladinApiActive": can_use_aladin_api(),
         "yes24Configured": bool(YES24_API_KEY),
         "kakaoConfigured": bool(KAKAO_REST_API_KEY),
-        "searchProvider": "YES24 primary + Kakao fallback",
-        "imageProvider": "Aladin web",
+        "searchProvider": current_search_provider(),
+        "imageProvider": "Aladin web (front/spine/back)",
     }
 
 
@@ -70,8 +122,11 @@ def read_root():
 def keep_awake():
     return {
         "status": "ok",
+        "aladinApiActive": can_use_aladin_api(),
+        "aladinApiEndDate": get_aladin_end_date().isoformat(),
         "yes24Configured": bool(YES24_API_KEY),
         "kakaoConfigured": bool(KAKAO_REST_API_KEY),
+        "searchProvider": current_search_provider(),
     }
 
 
@@ -135,6 +190,149 @@ def make_unique_key(book: dict) -> str:
     author = compact_compare_text(book.get("author", ""))
     publisher = compact_compare_text(book.get("publisher", ""))
     return f"meta:{title}|{author}|{publisher}"
+
+
+# ============================================================
+# Aladin TTB API - active through 2026-10-30
+# ============================================================
+
+def require_ttb_key():
+    if not TTB_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="ALADIN_TTB_KEY 환경변수가 설정되지 않았습니다.",
+        )
+
+
+def normalize_cover_url(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+
+    return (
+        str(url)
+        .replace("http://", "https://", 1)
+        .replace("coversum", "cover500")
+        .replace("cover150", "cover500")
+        .replace("cover200", "cover500")
+        .replace("/cover/", "/cover500/")
+    )
+
+
+def aladin_api_get(endpoint: str, params: dict, timeout: int = 15) -> dict:
+    """알라딘 TTB API 공통 GET 요청. 종료일 이후에는 호출하지 않습니다."""
+    require_ttb_key()
+
+    url = f"{ALADIN_API_BASE}/{endpoint}"
+    request_params = {
+        "ttbkey": TTB_KEY,
+        "output": "js",
+        "Version": "20131101",
+        **params,
+    }
+
+    try:
+        response = requests.get(
+            url,
+            params=request_params,
+            headers={
+                **DEFAULT_HEADERS,
+                "Accept": "application/json,text/plain,*/*",
+            },
+            timeout=(5, timeout),
+            allow_redirects=True,
+        )
+    except requests.RequestException as error:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "알라딘 API 네트워크 오류",
+                "reason": str(error),
+            },
+        )
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "알라딘 API 요청 거부",
+                "upstreamStatus": response.status_code,
+            },
+        )
+
+    try:
+        return response.json()
+    except ValueError:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "알라딘 API JSON 파싱 오류",
+                "upstreamStatus": response.status_code,
+            },
+        )
+
+
+def aladin_search_books(
+    query: str,
+    max_results: int,
+    query_type: str = "Keyword",
+) -> dict:
+    allowed_query_types = {"Keyword", "Author", "Title"}
+    if query_type not in allowed_query_types:
+        query_type = "Keyword"
+
+    data = aladin_api_get(
+        "ItemSearch.aspx",
+        {
+            "Query": query.strip(),
+            "QueryType": query_type,
+            "MaxResults": max_results,
+            "start": 1,
+            "SearchTarget": "Book",
+        },
+    )
+
+    for book in data.get("item", []):
+        if book.get("cover"):
+            book["cover"] = normalize_cover_url(book["cover"])
+        book["source"] = "aladin"
+        book["coverSource"] = "aladin"
+
+    data["searchProvider"] = "aladin-ttb"
+    data["coverPolicy"] = "Aladin cover through 2026-10-30"
+    data["providerSwitchDate"] = "2026-10-31"
+    return data
+
+
+def hybrid_search_books(
+    query: str,
+    max_results: int,
+    query_type: str,
+) -> dict:
+    """
+    1) 2026-10-30까지: Aladin TTB 우선
+    2) 알라딘 장애/키 없음/2026-10-31 이후: YES24
+    3) YES24 결과가 부족할 때: Kakao 발견 -> 가능하면 YES24 상세로 재정규화
+    """
+    aladin_error = None
+
+    if can_use_aladin_api():
+        try:
+            return aladin_search_books(query, max_results, query_type)
+        except HTTPException as error:
+            aladin_error = error.detail
+            print("[SEARCH] Aladin failed, falling back to YES24/Kakao:", aladin_error)
+
+    try:
+        result = search_books_internal(query, max_results, query_type)
+        if aladin_error:
+            result["aladinFallbackReason"] = aladin_error
+        result["providerSwitchDate"] = "2026-10-31"
+        return result
+    except HTTPException:
+        # 날짜가 남아 있지만 알라딘 장애 + 후속 API도 미설정된 경우 원래 알라딘 오류를 보존
+        if aladin_error:
+            raise HTTPException(status_code=502, detail=aladin_error)
+        raise
 
 
 # ============================================================
@@ -350,7 +548,7 @@ def yes24_search_books(
     # Title/Author는 YES24 검색 후 서버 필터링을 하므로 넉넉하게 받습니다.
     fetch_size = max_results
     if query_type in {"Title", "Author"}:
-        fetch_size = min(max(max_results * 3, 20), 100)
+        fetch_size = min(max(max_results * 3, 20), 50)
 
     data = yes24_api_get(
         "goods/itemList",
@@ -683,7 +881,7 @@ def search_books(
     max_results: int = Query(10, ge=1, le=50),
     query_type: str = Query("Keyword"),
 ):
-    return search_books_internal(query, max_results, query_type)
+    return hybrid_search_books(query, max_results, query_type)
 
 
 # 기존 프론트가 /api/ttb/search?Query=... 를 사용해도 깨지지 않도록 유지합니다.
@@ -691,7 +889,7 @@ def search_books(
 def ttb_search_proxy(
     Query_param: str = Query(..., alias="Query", min_length=1, max_length=200),
 ):
-    return search_books_internal(Query_param, 10, "Keyword")
+    return hybrid_search_books(Query_param, 10, "Keyword")
 
 
 # ============================================================
@@ -822,6 +1020,95 @@ def kakao_detail_by_isbn(isbn13: str) -> Optional[dict]:
     return None
 
 
+def extract_isbn13_from_aladin_item_id(item_id: str) -> str:
+    """종료 후 기존 DB의 Aladin ItemId를 ISBN13으로 이어주기 위한 호환 함수."""
+    raw = str(item_id or "").strip()
+    if not raw.isdigit():
+        return ""
+
+    try:
+        response = safe_requests_get(
+            f"{ALADIN_WEB_BASE}/shop/wproduct.aspx?ItemId={raw}",
+            headers=DEFAULT_HEADERS,
+            timeout=(5, 15),
+        )
+        if response.status_code != 200:
+            return ""
+
+        # HTML/구조화 데이터에 노출된 ISBN13 후보를 찾습니다.
+        candidates = re.findall(r"(?<!\d)(97[89]\d{10})(?!\d)", response.text)
+        for candidate in candidates:
+            if is_isbn13(candidate):
+                return candidate
+    except Exception as error:
+        print("[ALADIN] ISBN recovery failed:", error)
+
+    return ""
+
+
+def lookup_after_aladin_cutoff(
+    item_id: str,
+    item_id_type: str,
+    title: str,
+    author: str,
+    publisher: str,
+) -> Optional[dict]:
+    """알라딘 API 종료 후 YES24 -> Kakao 순서로 상세 정보를 찾습니다."""
+    raw = str(item_id or "").strip()
+    clean = digits_only(raw)
+    book = None
+
+    # 새 데이터: ISBN13을 공통 ID로 사용
+    if is_isbn13(clean):
+        if YES24_API_KEY:
+            try:
+                book = yes24_detail(clean, "ISBN13")
+            except HTTPException as error:
+                print("[YES24] ISBN detail failed:", error.detail)
+        if not book:
+            book = kakao_detail_by_isbn(clean)
+        return book
+
+    # YES24 상품번호를 명시적으로 보낸 경우
+    if raw.upper().startswith("YES24:"):
+        yes_id = raw.split(":", 1)[1].strip()
+        if YES24_API_KEY:
+            try:
+                return yes24_detail(yes_id, "ItemId")
+            except HTTPException:
+                return None
+
+    # 과거 Aladin ItemId와 YES24 ItemId는 모두 숫자라 충돌할 수 있으므로
+    # 제목/저자/출판사가 있으면 메타데이터 재검색을 먼저 수행합니다.
+    if title.strip() and YES24_API_KEY:
+        book = find_yes24_book_by_metadata(title, author, publisher)
+        if book:
+            return book
+
+    # 기존 Aladin ItemId에서 ISBN13을 웹 페이지로 복구한 뒤 YES24/Kakao에 연결합니다.
+    if clean.isdigit():
+        recovered_isbn = extract_isbn13_from_aladin_item_id(clean)
+        if recovered_isbn:
+            if YES24_API_KEY:
+                try:
+                    book = yes24_detail(recovered_isbn, "ISBN13")
+                except HTTPException:
+                    book = None
+            if not book:
+                book = kakao_detail_by_isbn(recovered_isbn)
+            if book:
+                return book
+
+    # 마지막으로 정말 YES24 ItemId였을 가능성을 확인합니다.
+    if clean.isdigit() and YES24_API_KEY and item_id_type == "ItemId":
+        try:
+            return yes24_detail(clean, "ItemId")
+        except HTTPException:
+            pass
+
+    return None
+
+
 @app.get("/api/ttb/lookup")
 def ttb_lookup_proxy(
     ItemId: str = Query(..., min_length=1),
@@ -832,45 +1119,59 @@ def ttb_lookup_proxy(
     publisher: str = Query(""),
 ):
     """
-    이름은 프론트 호환 때문에 /api/ttb/lookup으로 유지하지만,
-    실제 상세 정보는 YES24에서 가져옵니다.
+    2026-10-30까지는 기존 Aladin TTB ItemLookUp을 우선 사용합니다.
+    2026-10-31부터는 YES24 상세 조회로 자동 전환합니다.
+    Aladin이 종료일 전에 장애를 일으켜도 YES24/Kakao로 자동 fallback 합니다.
     """
-    del OptResult  # 기존 파라미터 호환용. YES24에서는 사용하지 않음.
+    aladin_error = None
 
-    search_type, identifier = resolve_yes24_lookup_type(ItemId, itemIdType)
-
-    book = None
-
-    if YES24_API_KEY:
+    if can_use_aladin_api():
         try:
-            book = yes24_detail(identifier, search_type)
+            data = aladin_api_get(
+                "ItemLookUp.aspx",
+                {
+                    "ItemId": ItemId,
+                    "ItemIdType": itemIdType,
+                    "OptResult": OptResult,
+                },
+            )
+            if data.get("item"):
+                for book in data.get("item", []):
+                    if book.get("cover"):
+                        book["cover"] = normalize_cover_url(book["cover"])
+                    book["source"] = "aladin"
+                    book["coverSource"] = "aladin"
+                data["detailProvider"] = "aladin-ttb"
+                data["providerSwitchDate"] = "2026-10-31"
+                return data
         except HTTPException as error:
-            print("[YES24] Detail lookup failed:", error.detail)
+            aladin_error = error.detail
+            print("[LOOKUP] Aladin failed, falling back to YES24/Kakao:", aladin_error)
 
-    # ItemId로 조회했는데 결과가 없고 실제 값이 ISBN13처럼 보인다면 ISBN13으로 재시도
-    if not book and YES24_API_KEY and is_isbn13(ItemId):
-        try:
-            book = yes24_detail(digits_only(ItemId), "ISBN13")
-        except HTTPException:
-            pass
-
-    # 기존 DB에 저장된 Aladin ItemId는 YES24 ItemId와 숫자 형태가 겹칠 수 있습니다.
-    # YES24 직접 조회가 실패하면 함께 전달된 제목/저자/출판사로 재검색합니다.
-    if not book and YES24_API_KEY and title.strip():
-        book = find_yes24_book_by_metadata(
-            title=title,
-            author=author,
-            publisher=publisher,
-        )
-
-    # YES24를 못 쓰는 개발 단계/장애 상황에서는 카카오 ISBN 상세로 최소 보완
-    if not book and is_isbn13(ItemId):
-        book = kakao_detail_by_isbn(digits_only(ItemId))
+    book = lookup_after_aladin_cutoff(
+        item_id=ItemId,
+        item_id_type=itemIdType,
+        title=title,
+        author=author,
+        publisher=publisher,
+    )
 
     if not book:
-        return {"item": []}
+        return {
+            "item": [],
+            "detailProvider": "yes24+kakao",
+            "providerSwitchDate": "2026-10-31",
+            **({"aladinFallbackReason": aladin_error} if aladin_error else {}),
+        }
 
-    return {"item": [book]}
+    result = {
+        "item": [book],
+        "detailProvider": book.get("source", "yes24"),
+        "providerSwitchDate": "2026-10-31",
+    }
+    if aladin_error:
+        result["aladinFallbackReason"] = aladin_error
+    return result
 
 
 # 새 코드에서 의미가 더 분명한 별칭도 함께 제공합니다.
@@ -1171,7 +1472,7 @@ def resolve_aladin_item_id(
     ISBN13/ISBN10/YES24 ItemId/기존 Aladin ItemId를
     알라딘 웹 상품 페이지의 숫자 ItemId로 변환합니다.
 
-    이전 코드와 달리 Aladin TTB API는 전혀 호출하지 않습니다.
+    2026-10-30까지는 ISBN→Aladin ItemId 변환에 TTB API를 우선 사용하고, 이후에는 웹 검색으로 전환합니다.
     """
     raw = str(lookup_id or "").strip()
 
@@ -1193,12 +1494,32 @@ def resolve_aladin_item_id(
     digits = digits_only(raw)
     search_queries: list[str] = []
 
-    # ISBN이면 알라딘 웹 검색에서 ISBN을 최우선으로 사용합니다.
+    # ISBN은 2026-10-30까지 TTB ItemLookUp으로 Aladin ItemId를 바로 얻는 것이 가장 정확합니다.
     if is_isbn13(digits) or is_isbn10(digits):
+        if can_use_aladin_api():
+            try:
+                data = aladin_api_get(
+                    "ItemLookUp.aspx",
+                    {
+                        "ItemId": digits,
+                        "ItemIdType": "ISBN13" if is_isbn13(digits) else "ISBN",
+                    },
+                )
+                items = data.get("item") or []
+                if items and items[0].get("itemId"):
+                    return str(items[0]["itemId"])
+            except HTTPException as error:
+                print("[ALADIN] TTB image-ID lookup failed:", error.detail)
+
+        # 종료 후에는 알라딘 웹 검색으로 이어갑니다.
         search_queries.append(digits)
 
-    # 숫자 상품번호인데 ISBN이 아니면 YES24 ItemId일 가능성을 먼저 확인합니다.
+    # 숫자 ID는 기존 Aladin ItemId와 YES24 ItemId가 충돌할 수 있습니다.
     elif digits.isdigit() and 6 <= len(digits) <= 12:
+        # 제목이 있거나 실제 알라딘 상품 페이지가 확인되면 기존 Aladin ItemId를 우선 존중합니다.
+        if validate_direct_aladin_item_id(digits, title=title):
+            return digits
+
         isbn13 = get_yes24_isbn_from_item_id(digits)
         if isbn13:
             search_queries.append(isbn13)
